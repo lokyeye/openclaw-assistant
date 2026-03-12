@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP_BIN="$ROOT/OpenClaw小助手.app/Contents/MacOS/OpenClawAssistant"
+RELEASE_BIN="$ROOT/.build/release/OpenClawAssistant"
+DEBUG_BIN="$ROOT/.build/debug/OpenClawAssistant"
+
+if [[ -x "$APP_BIN" ]]; then
+  exec "$APP_BIN" "$@"
+fi
+
+if [[ -x "$RELEASE_BIN" ]]; then
+  exec "$RELEASE_BIN" "$@"
+fi
+
+if [[ -x "$DEBUG_BIN" ]]; then
+  exec "$DEBUG_BIN" "$@"
+fi
+
+echo "OpenClawAssistant binary not found. Build the app first." >&2
+exit 1

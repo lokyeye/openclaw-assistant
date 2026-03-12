@@ -1,0 +1,424 @@
+import AppKit
+import Foundation
+
+final class InstanceSupervisor {
+    private struct ObservedProcess {
+        let pid: Int32
+        let command: String
+        let currentDirectory: String?
+    }
+
+    private let store: ConfigurationStore
+    private var configuration: AssistantConfiguration
+    private var runtime: RuntimeState
+
+    init(store: ConfigurationStore) {
+        self.store = store
+        self.configuration = store.loadConfiguration()
+        self.runtime = store.loadRuntime()
+    }
+
+    func reloadConfiguration() {
+        configuration = store.loadConfiguration()
+        runtime = store.loadRuntime()
+    }
+
+    func reports() -> [InstanceReport] {
+        reloadConfiguration()
+        let processes = observedProcesses()
+        var textReferenceCache: [Int32: [String]] = [:]
+
+        return configuration.instances.map { instance in
+            let runtimeState = runtime.instances[instance.id] ?? .empty
+            let repoPath = instance.expandedRepoPath
+            let repoExists = repositoryLooksValid(for: instance)
+            let observedPIDs = repoExists
+                ? matchingPIDs(for: instance, in: processes, textReferenceCache: &textReferenceCache)
+                : []
+            let branch = repoExists ? currentGitBranch(for: repoPath) : nil
+            let lastActivity = FileSystem.latestModificationDate(
+                for: instance.activityPaths + [store.logURL(for: instance).path]
+            )
+            let recentLog = FileSystem.lastNonEmptyLine(in: store.logURL(for: instance))
+
+            let status = resolveStatus(
+                for: instance,
+                runtime: runtimeState,
+                repoExists: repoExists,
+                observedPIDs: observedPIDs
+            )
+
+            return InstanceReport(
+                instance: instance,
+                runtime: runtimeState,
+                status: status,
+                observedPIDs: observedPIDs,
+                repoExists: repoExists,
+                repoBranch: branch,
+                lastActivityAt: lastActivity,
+                recentLogLine: recentLog,
+                logFileURL: store.logURL(for: instance)
+            )
+        }
+    }
+
+    func start(instanceID: String) throws {
+        reloadConfiguration()
+        guard let instance = configuration.instances.first(where: { $0.id == instanceID }) else {
+            return
+        }
+        guard !instance.disabled else {
+            return
+        }
+        guard repositoryLooksValid(for: instance) else {
+            throw SupervisorError.invalidRepository(instance.expandedRepoPath)
+        }
+
+        let report = reports().first(where: { $0.id == instanceID })
+        if report?.status == .running || report?.status == .starting {
+            return
+        }
+
+        let repoURL = URL(fileURLWithPath: instance.expandedRepoPath)
+        let logURL = store.logURL(for: instance)
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        }
+
+        let outputHandle = try FileHandle(forWritingTo: logURL)
+        try outputHandle.seekToEnd()
+
+        let process = Process()
+        process.currentDirectoryURL = repoURL
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+
+        var processEnvironment = instance.env
+        processEnvironment["OPENCLAW_ASSISTANT_INSTANCE_ID"] = instance.id
+        processEnvironment["OPENCLAW_ASSISTANT_INSTANCE_NAME"] = instance.name
+
+        let envAssignments = processEnvironment
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+        process.arguments = envAssignments + instance.startCommand
+        process.standardOutput = outputHandle
+        process.standardError = outputHandle
+
+        let runtimeURL = store.runtimeURL
+        let instanceID = instance.id
+        process.terminationHandler = { finishedProcess in
+            Self.recordTermination(
+                runtimeURL: runtimeURL,
+                instanceID: instanceID,
+                exitCode: finishedProcess.terminationStatus
+            )
+        }
+
+        try process.run()
+
+        var nextRuntime = runtime.instances[instance.id] ?? .empty
+        nextRuntime.pid = process.processIdentifier
+        nextRuntime.lastStartedAt = Date()
+        nextRuntime.lastStopWasManual = false
+        nextRuntime.lastExitCode = nil
+        runtime.instances[instance.id] = nextRuntime
+        try store.save(runtime: runtime)
+    }
+
+    func stop(instanceID: String) throws {
+        reloadConfiguration()
+        guard configuration.instances.contains(where: { $0.id == instanceID }) else {
+            return
+        }
+
+        let report = reports().first(where: { $0.id == instanceID })
+        guard let report else { return }
+
+        var nextRuntime = runtime.instances[instanceID] ?? .empty
+        nextRuntime.lastStopWasManual = true
+        nextRuntime.lastStoppedAt = Date()
+        runtime.instances[instanceID] = nextRuntime
+        try store.save(runtime: runtime)
+
+        for pid in report.observedPIDs {
+            _ = ProcessRunner.run(executable: "/bin/kill", arguments: ["-TERM", String(pid)])
+        }
+
+        let waitUntil = Date().addingTimeInterval(2)
+        while Date() < waitUntil {
+            var textReferenceCache: [Int32: [String]] = [:]
+            let refreshedPIDs = matchingPIDs(
+                for: report.instance,
+                in: observedProcesses(),
+                textReferenceCache: &textReferenceCache
+            )
+            if refreshedPIDs.isEmpty {
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+
+        var textReferenceCache: [Int32: [String]] = [:]
+        for pid in matchingPIDs(
+            for: report.instance,
+            in: observedProcesses(),
+            textReferenceCache: &textReferenceCache
+        ) {
+            _ = ProcessRunner.run(executable: "/bin/kill", arguments: ["-KILL", String(pid)])
+        }
+
+        nextRuntime.pid = nil
+        runtime.instances[instanceID] = nextRuntime
+        try store.save(runtime: runtime)
+    }
+
+    func restart(instanceID: String) throws {
+        try stop(instanceID: instanceID)
+        Thread.sleep(forTimeInterval: 0.2)
+        try start(instanceID: instanceID)
+    }
+
+    func startAll() throws {
+        reloadConfiguration()
+        for instance in configuration.instances where !instance.disabled {
+            try start(instanceID: instance.id)
+        }
+    }
+
+    func stopAll() throws {
+        reloadConfiguration()
+        for instance in configuration.instances where !instance.disabled {
+            try stop(instanceID: instance.id)
+        }
+    }
+
+    func restartAll() throws {
+        reloadConfiguration()
+        for instance in configuration.instances where !instance.disabled {
+            try restart(instanceID: instance.id)
+        }
+    }
+
+    private func resolveStatus(
+        for instance: OpenClawInstance,
+        runtime: InstanceRuntimeState,
+        repoExists: Bool,
+        observedPIDs: [Int32]
+    ) -> InstanceStatus {
+        if instance.disabled {
+            return .disabled
+        }
+        if !repoExists {
+            return .missingProject
+        }
+        if !observedPIDs.isEmpty {
+            if let lastStartedAt = runtime.lastStartedAt,
+               Date().timeIntervalSince(lastStartedAt) < 8 {
+                return .starting
+            }
+            return .running
+        }
+        if runtime.lastStopWasManual {
+            return .stopped
+        }
+        if runtime.lastCrashedAt != nil || runtime.lastExitCode.map({ $0 != 0 }) == true {
+            return .crashed
+        }
+        return .stopped
+    }
+
+    private func matchingPIDs(
+        for instance: OpenClawInstance,
+        in processes: [ObservedProcess],
+        textReferenceCache: inout [Int32: [String]]
+    ) -> [Int32] {
+        let matchers = instance.processMatch.isEmpty
+            ? ["OPENCLAW_ASSISTANT_INSTANCE_ID=\(instance.id)"]
+            : instance.processMatch
+        let repoPath = standardizedPath(instance.expandedRepoPath)
+        let launchTokens = instance.startCommand
+            .map { $0.lowercased() }
+            .filter { !$0.contains("=") && $0.count >= 3 }
+
+        return processes.compactMap { process in
+            let command = process.command.lowercased()
+            let matchesConfigured = matchers.allSatisfy { command.contains($0.lowercased()) }
+            let matchesRepoPath = command.contains(repoPath)
+            let matchesCurrentDirectory = process.currentDirectory.map { standardizedPath($0) == repoPath } ?? false
+            let matchesLaunchTokens = !launchTokens.isEmpty && launchTokens.allSatisfy { command.contains($0) }
+            let looksLikeOpenClawProcess =
+                command.contains("scripts/run-node.mjs") ||
+                command.contains("gateway") ||
+                command.contains("openclaw")
+            let matchesTextReferences =
+                looksLikeOpenClawProcess &&
+                processReferencesRepository(
+                    pid: process.pid,
+                    repoPath: repoPath,
+                    cache: &textReferenceCache
+                )
+
+            guard
+                matchesConfigured ||
+                matchesRepoPath ||
+                matchesTextReferences ||
+                (matchesCurrentDirectory && (matchesLaunchTokens || looksLikeOpenClawProcess))
+            else {
+                return nil
+            }
+            return process.pid
+        }
+    }
+
+    private func observedProcesses() -> [ObservedProcess] {
+        let psOutput = ProcessRunner.run(
+            executable: "/bin/ps",
+            arguments: ["-axo", "pid=,command="]
+        ).stdout
+
+        return psOutput
+            .split(separator: "\n")
+            .compactMap { line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.isEmpty else { return nil }
+                guard let splitIndex = trimmed.firstIndex(where: \.isWhitespace) else { return nil }
+
+                let pidString = trimmed[..<splitIndex]
+                let command = trimmed[splitIndex...].trimmingCharacters(in: .whitespaces)
+                guard let pid = Int32(pidString) else { return nil }
+
+                let currentDirectory = shouldInspectCurrentDirectory(for: command)
+                    ? currentWorkingDirectory(for: pid)
+                    : nil
+
+                return ObservedProcess(
+                    pid: pid,
+                    command: command,
+                    currentDirectory: currentDirectory
+                )
+            }
+    }
+
+    private func repositoryLooksValid(for instance: OpenClawInstance) -> Bool {
+        let repoURL = URL(fileURLWithPath: instance.expandedRepoPath)
+        guard FileSystem.directoryExists(atPath: repoURL.path) else {
+            return false
+        }
+
+        let packageJSON = repoURL.appendingPathComponent("package.json").path
+        let openClawEntry = repoURL.appendingPathComponent("openclaw.mjs").path
+        guard FileSystem.fileExists(atPath: packageJSON) || FileSystem.fileExists(atPath: openClawEntry) else {
+            return false
+        }
+
+        if instance.startCommand.contains("scripts/run-node.mjs") {
+            let runNodeScript = repoURL.appendingPathComponent("scripts/run-node.mjs").path
+            guard FileSystem.fileExists(atPath: runNodeScript) else {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    private func shouldInspectCurrentDirectory(for command: String) -> Bool {
+        let lowered = command.lowercased()
+        return ["node", "pnpm", "npm", "yarn", "bun", "openclaw", "gateway"].contains(where: lowered.contains)
+    }
+
+    private func currentWorkingDirectory(for pid: Int32) -> String? {
+        let result = ProcessRunner.run(
+            executable: "/usr/sbin/lsof",
+            arguments: ["-a", "-d", "cwd", "-p", String(pid), "-Fn"]
+        )
+        guard result.exitCode == 0 else {
+            return nil
+        }
+
+        return result.stdout
+            .split(separator: "\n")
+            .first(where: { $0.hasPrefix("n") })
+            .map { String($0.dropFirst()) }
+    }
+
+    private func processReferencesRepository(
+        pid: Int32,
+        repoPath: String,
+        cache: inout [Int32: [String]]
+    ) -> Bool {
+        let references: [String]
+        if let cached = cache[pid] {
+            references = cached
+        } else {
+            let result = ProcessRunner.run(
+                executable: "/usr/sbin/lsof",
+                arguments: ["-a", "-d", "txt", "-p", String(pid), "-Fn"]
+            )
+            let parsed = result.stdout
+                .split(separator: "\n")
+                .filter { $0.hasPrefix("n") }
+                .map { standardizedPath(String($0.dropFirst())) }
+            cache[pid] = parsed
+            references = parsed
+        }
+
+        return references.contains { reference in
+            reference == repoPath || reference.hasPrefix("\(repoPath)/")
+        }
+    }
+
+    private func standardizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path.lowercased()
+    }
+
+    private func currentGitBranch(for repoPath: String) -> String? {
+        let result = ProcessRunner.run(
+            executable: "/usr/bin/git",
+            arguments: ["-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD"]
+        )
+        guard result.exitCode == 0 else {
+            return nil
+        }
+        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func recordTermination(runtimeURL: URL, instanceID: String, exitCode: Int32) {
+        let runtime: RuntimeState
+        if let data = try? Data(contentsOf: runtimeURL),
+           let decoded = try? JSONDecoder().decode(RuntimeState.self, from: data) {
+            runtime = decoded
+        } else {
+            runtime = .empty
+        }
+
+        var nextRuntime = runtime.instances[instanceID] ?? .empty
+        let wasManualStop = nextRuntime.lastStopWasManual
+        nextRuntime.pid = nil
+        nextRuntime.lastExitCode = exitCode
+
+        if wasManualStop {
+            nextRuntime.lastStoppedAt = Date()
+        } else if exitCode != 0 {
+            nextRuntime.lastCrashedAt = Date()
+        }
+
+        var nextState = runtime
+        nextState.instances[instanceID] = nextRuntime
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(nextState) {
+            try? data.write(to: runtimeURL, options: .atomic)
+        }
+    }
+}
+
+private enum SupervisorError: LocalizedError {
+    case invalidRepository(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .invalidRepository(path):
+            return "项目目录缺失或不完整：\(path)"
+        }
+    }
+}

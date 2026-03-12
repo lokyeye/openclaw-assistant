@@ -1,0 +1,5 @@
+.build
+dist
+.DS_Store
+*.app
+CODEX_APP_HANDOFF.md

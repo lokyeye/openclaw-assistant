@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff8a3d" />
+      <stop offset="100%" stop-color="#ff4d4f" />
+    </linearGradient>
+    <linearGradient id="claw" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#fff7ef" />
+      <stop offset="100%" stop-color="#ffffff" />
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="224" fill="url(#bg)" />
+  <path d="M367 304c-88 0-159 71-159 159 0 79 57 145 133 157-15 76 44 148 123 148 89 0 160-72 160-160V465c0-89-72-161-161-161H367z" fill="url(#claw)" opacity="0.18"/>
+  <path d="M311 351c0-58 47-105 105-105h51c79 0 143 64 143 143v215c0 81-66 147-147 147-65 0-119-43-138-102 72-11 128-74 128-149v-91H416c-58 0-105-47-105-105z" fill="url(#claw)"/>
+  <path d="M650 351c0-58-47-105-105-105h-51c-79 0-143 64-143 143v215c0 81 66 147 147 147 65 0 119-43 138-102-72-11-128-74-128-149v-91h37c58 0 105-47 105-105z" fill="url(#claw)"/>
+  <rect x="425" y="538" width="174" height="154" rx="64" fill="#fff7ef"/>
+</svg>
