@@ -27,14 +27,27 @@ final class InstanceSupervisor {
         reloadConfiguration()
         let processes = observedProcesses()
         var textReferenceCache: [Int32: [String]] = [:]
+        var nextRuntime = runtime
+        var didMutateRuntime = false
 
-        return configuration.instances.map { instance in
-            let runtimeState = runtime.instances[instance.id] ?? .empty
+        let reports = configuration.instances.map { instance in
+            var runtimeState = nextRuntime.instances[instance.id] ?? .empty
             let repoPath = instance.expandedRepoPath
             let repoExists = repositoryLooksValid(for: instance)
             let observedPIDs = repoExists
                 ? matchingPIDs(for: instance, in: processes, textReferenceCache: &textReferenceCache)
                 : []
+
+            let observedRuntimeState = synchronizedRuntimeState(
+                runtimeState,
+                withObservedPIDs: observedPIDs
+            )
+            if observedRuntimeState != runtimeState {
+                runtimeState = observedRuntimeState
+                nextRuntime.instances[instance.id] = observedRuntimeState
+                didMutateRuntime = true
+            }
+
             let branch = repoExists ? currentGitBranch(for: repoPath) : nil
             let lastActivity = FileSystem.latestModificationDate(
                 for: instance.activityPaths + [store.logURL(for: instance).path]
@@ -60,6 +73,13 @@ final class InstanceSupervisor {
                 logFileURL: store.logURL(for: instance)
             )
         }
+
+        if didMutateRuntime {
+            runtime = nextRuntime
+            try? store.save(runtime: nextRuntime)
+        }
+
+        return reports
     }
 
     func start(instanceID: String) throws {
@@ -318,6 +338,41 @@ final class InstanceSupervisor {
         }
 
         return true
+    }
+
+    private func synchronizedRuntimeState(
+        _ runtimeState: InstanceRuntimeState,
+        withObservedPIDs observedPIDs: [Int32]
+    ) -> InstanceRuntimeState {
+        guard let observedPID = observedPIDs.first else {
+            return runtimeState
+        }
+
+        var next = runtimeState
+        var didChange = false
+
+        if next.pid != observedPID {
+            next.pid = observedPID
+            didChange = true
+        }
+        if next.lastStopWasManual {
+            next.lastStopWasManual = false
+            didChange = true
+        }
+        if next.lastStartedAt == nil {
+            next.lastStartedAt = Date()
+            didChange = true
+        }
+        if next.lastCrashedAt != nil {
+            next.lastCrashedAt = nil
+            didChange = true
+        }
+        if next.lastExitCode != nil {
+            next.lastExitCode = nil
+            didChange = true
+        }
+
+        return didChange ? next : runtimeState
     }
 
     private func shouldInspectCurrentDirectory(for command: String) -> Bool {

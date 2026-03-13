@@ -85,7 +85,7 @@ struct RuntimeState: Codable {
     static let empty = RuntimeState(instances: [:])
 }
 
-struct InstanceRuntimeState: Codable {
+struct InstanceRuntimeState: Codable, Equatable {
     var pid: Int32?
     var lastStartedAt: Date?
     var lastStoppedAt: Date?
