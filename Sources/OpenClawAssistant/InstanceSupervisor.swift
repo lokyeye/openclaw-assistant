@@ -345,7 +345,21 @@ final class InstanceSupervisor {
         withObservedPIDs observedPIDs: [Int32]
     ) -> InstanceRuntimeState {
         guard let observedPID = observedPIDs.first else {
-            return runtimeState
+            guard runtimeState.pid != nil, !runtimeState.lastStopWasManual else {
+                return runtimeState
+            }
+
+            var next = runtimeState
+            var didChange = false
+            if next.pid != nil {
+                next.pid = nil
+                didChange = true
+            }
+            if next.lastCrashedAt == nil {
+                next.lastCrashedAt = Date()
+                didChange = true
+            }
+            return didChange ? next : runtimeState
         }
 
         var next = runtimeState

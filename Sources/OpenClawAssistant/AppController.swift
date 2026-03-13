@@ -81,7 +81,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func buildMenu(reports: [InstanceReport]) -> NSMenu {
         let menu = NSMenu()
 
-        let runningCount = reports.filter { $0.status == .running || $0.status == .starting }.count
+        let runningCount = reports.filter { $0.status == .running }.count
         let header = NSMenuItem(title: "OpenClaw 小助手  已运行 \(runningCount)/\(reports.count)", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
@@ -166,6 +166,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         let managementURL = managementURL(for: report)
 
         submenu.addItem(disabledItem("状态: \(report.status.label)"))
+        let automationEnabled = store.loadConfiguration().autoRestartCrashedInstances
+        if automationEnabled && (report.status == .crashed || report.status == .starting) {
+            submenu.addItem(disabledItem("保活: 已开启，正在自动重试"))
+        }
         submenu.addItem(disabledItem("PID: \(report.displayPID)"))
         submenu.addItem(disabledItem("分支: \(report.repoBranch ?? "-")"))
         submenu.addItem(disabledItem("项目路径: \(report.instance.repoPath)"))
@@ -349,15 +353,19 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
 
         let total = reports.count
-        let running = reports.filter { $0.status == .running || $0.status == .starting }.count
+        let running = reports.filter { $0.status == .running }.count
         let crashed = reports.filter { $0.status == .crashed }.count
         let missing = reports.filter { $0.status == .missingProject }.count
+        let starting = reports.filter { $0.status == .starting }.count
 
         if crashed > 0 {
             return "Claw !\(crashed)"
         }
         if missing > 0 {
             return "Claw ?\(missing)"
+        }
+        if starting > 0 {
+            return "Claw \(running)/\(total)"
         }
         return "Claw \(running)/\(total)"
     }
