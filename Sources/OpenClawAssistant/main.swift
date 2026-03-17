@@ -12,5 +12,5 @@ if !launchArguments.isEmpty {
 let application = NSApplication.shared
 let delegate = AppController()
 application.delegate = delegate
-application.setActivationPolicy(.accessory)
+application.setActivationPolicy(.regular)
 application.run()

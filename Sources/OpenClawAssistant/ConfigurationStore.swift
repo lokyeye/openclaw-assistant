@@ -116,6 +116,19 @@ final class ConfigurationStore {
         try bootstrapIfNeeded(fullRescan: true)
     }
 
+    func restoreIgnoredRepoPath(_ path: String) throws {
+        let normalizedTarget = normalizedPath(path)
+        let configuration = try updateConfiguration { configuration in
+            configuration.ignoredRepoPaths.removeAll { normalizedPath($0) == normalizedTarget }
+        }
+
+        guard !configuration.ignoredRepoPaths.contains(normalizedTarget) else {
+            return
+        }
+
+        try bootstrapIfNeeded()
+    }
+
     @discardableResult
     func updateConfiguration(_ mutate: (inout AssistantConfiguration) -> Void) throws -> AssistantConfiguration {
         var configuration = loadConfiguration()

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 APP_BIN="$ROOT/OpenClaw小助手.app/Contents/MacOS/OpenClawAssistant"
 RELEASE_BIN="$ROOT/.build/release/OpenClawAssistant"
 DEBUG_BIN="$ROOT/.build/debug/OpenClawAssistant"

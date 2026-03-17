@@ -1,6 +1,40 @@
 import Foundation
 
 enum AssistantCLI {
+    private struct ModelOptionPayload: Codable {
+        let id: String
+        let name: String?
+    }
+
+    private struct AgentModelPayload: Codable {
+        let agentId: String
+        let name: String
+        let currentModel: String?
+        let availableModels: [ModelOptionPayload]
+    }
+
+    private struct ModelsPayload: Codable {
+        let generatedAt: Date
+        let instanceId: String
+        let instanceName: String
+        let configPath: String
+        let agents: [AgentModelPayload]
+    }
+
+    private struct SetModelPayload: Codable {
+        let ok: Bool
+        let instanceId: String
+        let instanceName: String
+        let agentId: String
+        let model: String
+        let changed: Bool
+        let restarted: Bool
+        let configPath: String
+        let status: String?
+        let statusLabel: String?
+        let agents: [AgentModelPayload]
+    }
+
     private struct SettingsPayload: Codable {
         let launchAtLogin: Bool
         let launchAtLoginRegistered: Bool
@@ -65,6 +99,7 @@ enum AssistantCLI {
         }
 
         let supervisor = InstanceSupervisor(store: store)
+        let agentModelManager = AgentModelManager()
         guard let command = arguments.first else {
             printUsage()
             return 0
@@ -79,8 +114,17 @@ enum AssistantCLI {
                 return 0
             case "status", "list":
                 return try runStatus(arguments: remaining, store: store, supervisor: supervisor)
+            case "models":
+                return try runModels(arguments: remaining, store: store, agentModelManager: agentModelManager)
             case "settings":
                 return runSettings(store: store)
+            case "set-model":
+                return try runSetModel(
+                    arguments: remaining,
+                    store: store,
+                    supervisor: supervisor,
+                    agentModelManager: agentModelManager
+                )
             case "start":
                 return try runInstanceAction(
                     action: "start",
@@ -184,6 +228,76 @@ enum AssistantCLI {
 
     private static func runSettings(store: ConfigurationStore) -> Int32 {
         emitJSON(makeSettingsPayload(from: store.loadConfiguration()))
+    }
+
+    private static func runModels(
+        arguments: [String],
+        store: ConfigurationStore,
+        agentModelManager: AgentModelManager
+    ) throws -> Int32 {
+        guard let target = arguments.first else {
+            return fail("缺少实例 ID。\n\n\(usageText)")
+        }
+
+        let instance = try findInstance(target, store: store)
+        let catalog = try agentModelManager.catalog(for: instance)
+        return emitJSON(
+            ModelsPayload(
+                generatedAt: Date(),
+                instanceId: instance.id,
+                instanceName: instance.name,
+                configPath: catalog.configURL.path,
+                agents: catalog.agents.map(makeAgentModelPayload)
+            )
+        )
+    }
+
+    private static func runSetModel(
+        arguments: [String],
+        store: ConfigurationStore,
+        supervisor: InstanceSupervisor,
+        agentModelManager: AgentModelManager
+    ) throws -> Int32 {
+        guard arguments.count >= 3 else {
+            return fail("用法: OpenClawAssistant set-model <instance-id> <agent-id> <model-id>")
+        }
+
+        let instanceID = arguments[0]
+        let agentID = arguments[1]
+        let modelID = arguments[2]
+
+        let instance = try findInstance(instanceID, store: store)
+        let existingCatalog = try agentModelManager.catalog(for: instance)
+        let previousModelID = existingCatalog.agents.first(where: { $0.agentID == agentID })?.currentModelID
+        let changed = previousModelID != modelID
+
+        let catalog = try agentModelManager.setPrimaryModel(modelID, forAgent: agentID, in: instance)
+
+        var restarted = false
+        if changed,
+           let report = supervisor.reports().first(where: { $0.instance.id == instance.id }),
+           report.status == .running || report.status == .starting {
+            try supervisor.restart(instanceID: instance.id)
+            restarted = true
+        }
+
+        let refreshedReport = supervisor.reports().first(where: { $0.instance.id == instance.id })
+
+        return emitJSON(
+            SetModelPayload(
+                ok: true,
+                instanceId: instance.id,
+                instanceName: instance.name,
+                agentId: agentID,
+                model: modelID,
+                changed: changed,
+                restarted: restarted,
+                configPath: catalog.configURL.path,
+                status: refreshedReport?.status.rawValue,
+                statusLabel: refreshedReport?.status.label,
+                agents: catalog.agents.map(makeAgentModelPayload)
+            )
+        )
     }
 
     private static func runInstanceAction(
@@ -305,6 +419,14 @@ enum AssistantCLI {
         return filtered
     }
 
+    private static func findInstance(_ target: String, store: ConfigurationStore) throws -> OpenClawInstance {
+        let configuration = store.loadConfiguration()
+        guard let instance = configuration.instances.first(where: { $0.id == target }) else {
+            throw CLIError.message("未找到实例: \(target)")
+        }
+        return instance
+    }
+
     private static func makeCounts(from reports: [InstanceReport]) -> StatusCounts {
         StatusCounts(
             total: reports.count,
@@ -342,6 +464,17 @@ enum AssistantCLI {
             lastActivityAt: report.lastActivityAt,
             recentLogLine: report.recentLogLine,
             logFilePath: report.logFileURL.path
+        )
+    }
+
+    private static func makeAgentModelPayload(from info: OpenClawAgentModelInfo) -> AgentModelPayload {
+        AgentModelPayload(
+            agentId: info.agentID,
+            name: info.displayName,
+            currentModel: info.currentModelID,
+            availableModels: info.availableModels.map {
+                ModelOptionPayload(id: $0.id, name: $0.name)
+            }
         )
     }
 
@@ -391,7 +524,9 @@ enum AssistantCLI {
 
     用法:
       OpenClawAssistant status [instance-id]
+      OpenClawAssistant models <instance-id>
       OpenClawAssistant settings
+      OpenClawAssistant set-model <instance-id> <agent-id> <model-id>
       OpenClawAssistant start <instance-id>
       OpenClawAssistant stop <instance-id>
       OpenClawAssistant restart <instance-id>
@@ -405,8 +540,10 @@ enum AssistantCLI {
 
     示例:
       OpenClawAssistant status
+      OpenClawAssistant models nexus-link
       OpenClawAssistant settings
       OpenClawAssistant status nexus-link
+      OpenClawAssistant set-model nexus-link master openai-codex/gpt-5.4
       OpenClawAssistant start openclawcn
       OpenClawAssistant remove openclawcn
       OpenClawAssistant full-scan

@@ -147,8 +147,12 @@ enum FileSystem {
     }
 
     static func lastNonEmptyLine(in url: URL) -> String? {
+        lastNonEmptyLines(in: url, limit: 1).first
+    }
+
+    static func lastNonEmptyLines(in url: URL, limit: Int) -> [String] {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return nil
+            return []
         }
         defer {
             try? handle.close()
@@ -156,19 +160,21 @@ enum FileSystem {
 
         let fileSize = (try? handle.seekToEnd()) ?? 0
         let chunkSize = min(fileSize, 16 * 1024)
-        guard chunkSize > 0 else { return nil }
+        guard chunkSize > 0 else { return [] }
 
         try? handle.seek(toOffset: fileSize - chunkSize)
         let data = handle.readDataToEndOfFile()
         guard let text = String(data: data, encoding: .utf8) else {
-            return nil
+            return []
         }
 
         return text
             .split(separator: "\n")
             .reversed()
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first(where: { !$0.isEmpty })
+            .filter { !$0.isEmpty }
+            .prefix(limit)
+            .map { String($0) }
     }
 
     private static func maxDate(_ lhs: Date?, _ rhs: Date) -> Date {

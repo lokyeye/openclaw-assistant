@@ -5,3 +5,4 @@ dist
 *.app
 CODEX_APP_HANDOFF.md
 docs/images/*-full.png
+.codex-artifacts

@@ -2,16 +2,211 @@ import AppKit
 import Foundation
 
 @MainActor
-final class AppController: NSObject, NSApplicationDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    @MainActor
+    private final class AgentModelPickerController: NSObject {
+        let catalog: OpenClawInstanceModelCatalog
+        let view: NSView
+        let agentPopup: NSPopUpButton
+        let modelPopup: NSPopUpButton
+        private let hintLabel: NSTextField
+
+        init(catalog: OpenClawInstanceModelCatalog) {
+            self.catalog = catalog
+
+            let view = NSView(frame: NSRect(x: 0, y: 0, width: 430, height: 112))
+            let agentLabel = NSTextField(labelWithString: "智能体")
+            agentLabel.frame = NSRect(x: 0, y: 82, width: 80, height: 20)
+
+            let agentPopup = NSPopUpButton(frame: NSRect(x: 88, y: 78, width: 342, height: 26), pullsDown: false)
+            let modelLabel = NSTextField(labelWithString: "模型")
+            modelLabel.frame = NSRect(x: 0, y: 42, width: 80, height: 20)
+
+            let modelPopup = NSPopUpButton(frame: NSRect(x: 88, y: 38, width: 342, height: 26), pullsDown: false)
+            let hintLabel = NSTextField(labelWithString: "")
+            hintLabel.frame = NSRect(x: 0, y: 0, width: 430, height: 30)
+            hintLabel.textColor = .secondaryLabelColor
+            hintLabel.lineBreakMode = .byTruncatingMiddle
+
+            self.view = view
+            self.agentPopup = agentPopup
+            self.modelPopup = modelPopup
+            self.hintLabel = hintLabel
+
+            super.init()
+
+            agentPopup.target = self
+            agentPopup.action = #selector(agentSelectionDidChange(_:))
+
+            view.addSubview(agentLabel)
+            view.addSubview(agentPopup)
+            view.addSubview(modelLabel)
+            view.addSubview(modelPopup)
+            view.addSubview(hintLabel)
+
+            reloadAgentPopup()
+            reloadModelPopup()
+            hintLabel.stringValue = catalog.configURL.path
+        }
+
+        var selectedAgent: OpenClawAgentModelInfo? {
+            let index = agentPopup.indexOfSelectedItem
+            guard catalog.agents.indices.contains(index) else {
+                return nil
+            }
+            return catalog.agents[index]
+        }
+
+        var selectedModelID: String? {
+            modelPopup.selectedItem?.representedObject as? String
+        }
+
+        @objc private func agentSelectionDidChange(_ sender: NSPopUpButton) {
+            reloadModelPopup()
+        }
+
+        private func reloadAgentPopup() {
+            agentPopup.removeAllItems()
+            for agent in catalog.agents {
+                agentPopup.addItem(withTitle: agent.displayName)
+            }
+            if !catalog.agents.isEmpty {
+                agentPopup.selectItem(at: 0)
+            }
+        }
+
+        private func reloadModelPopup() {
+            modelPopup.removeAllItems()
+            guard let agent = selectedAgent else {
+                return
+            }
+
+            for option in agent.availableModels {
+                modelPopup.addItem(withTitle: option.displayTitle)
+                modelPopup.lastItem?.representedObject = option.id
+            }
+
+            if let currentModelID = agent.currentModelID,
+               let index = agent.availableModels.firstIndex(where: { $0.id == currentModelID }) {
+                modelPopup.selectItem(at: index)
+            } else if !agent.availableModels.isEmpty {
+                modelPopup.selectItem(at: 0)
+            }
+        }
+    }
+
+    private struct CrashGuidance {
+        let summary: String
+        let suggestion: String?
+        let configFileURL: URL?
+    }
+
+    private struct CachedModelCatalog {
+        let configURL: URL
+        let modifiedAt: Date?
+        let catalog: OpenClawInstanceModelCatalog
+        let summary: String
+    }
+
+    private struct CachedLaunchdLabels {
+        let labels: [String]
+        let fetchedAt: Date
+    }
+
     private let store = ConfigurationStore()
     private lazy var supervisor = InstanceSupervisor(store: store)
+    private let agentModelManager = AgentModelManager()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private lazy var workspaceActions = AssistantWorkspaceActions(
+        showOverview: { [weak self] in
+            self?.showMainWindow(route: .overview)
+        },
+        showAttention: { [weak self] in
+            self?.showMainWindow(route: .attention)
+        },
+        showSettings: { [weak self] in
+            self?.showMainWindow(route: .settings)
+        },
+        showInstanceDetail: { [weak self] instanceID in
+            self?.showMainWindow(route: .instanceDetail(instanceID))
+        },
+        refresh: { [weak self] in
+            self?.refreshNow()
+        },
+        startAll: { [weak self] in
+            self?.startAllInstances()
+        },
+        stopAll: { [weak self] in
+            self?.stopAllInstances()
+        },
+        startInstance: { [weak self] instanceID in
+            self?.startInstance(withID: instanceID)
+        },
+        restartInstance: { [weak self] instanceID in
+            self?.restartInstance(withID: instanceID)
+        },
+        stopInstance: { [weak self] instanceID in
+            self?.stopInstance(withID: instanceID)
+        },
+        removeInstance: { [weak self] instanceID in
+            self?.removeInstance(withID: instanceID)
+        },
+        openManagementPage: { [weak self] instanceID in
+            self?.openManagementPage(forInstanceID: instanceID)
+        },
+        openLogFile: { [weak self] instanceID in
+            self?.openLogFile(forInstanceID: instanceID)
+        },
+        openConfigFile: { [weak self] instanceID in
+            self?.openConfigFile(forInstanceID: instanceID)
+        },
+        openRepoFolder: { [weak self] instanceID in
+            self?.openRepoFolder(forInstanceID: instanceID)
+        },
+        openModelSheet: { [weak self] instanceID in
+            self?.openAgentModelSheet(forInstanceID: instanceID)
+        },
+        applyModelSelections: { [weak self] instanceID, assignments, restartIfRunning in
+            self?.switchAgentModels(
+                instanceID: instanceID,
+                assignments: assignments,
+                restartIfRunning: restartIfRunning
+            )
+        },
+        setLaunchAtLogin: { [weak self] enabled in
+            self?.setLaunchAtLogin(enabled)
+        },
+        setAutoStartOnLaunch: { [weak self] enabled in
+            self?.setAutoStartInstancesOnLaunch(enabled)
+        },
+        setAutoRestartCrashed: { [weak self] enabled in
+            self?.setAutoRestartCrashedInstances(enabled)
+        },
+        fullRescan: { [weak self] in
+            self?.fullRescanRepositories()
+        },
+        restoreIgnoredRepoPath: { [weak self] path in
+            self?.restoreIgnoredRepoPath(path)
+        }
+    )
+    private lazy var workspaceModel = AssistantWorkspaceModel(actions: workspaceActions)
+    private lazy var mainWindowController = AssistantWindowController(model: workspaceModel)
     private var refreshTimer: Timer?
     private var hasAppliedStartupAutomation = false
     private var lastObservedStatuses: [String: InstanceStatus] = [:]
     private var nextAutoRestartAttemptAt: [String: Date] = [:]
+    private var alertingCrashInstances: Set<String> = []
+    private var acknowledgedCrashSignatures: [String: String] = [:]
+    private var isMenuOpen = false
+    private var needsMenuRefreshAfterClose = false
+    private var currentReports: [InstanceReport] = []
+    private var currentReportsByID: [String: InstanceReport] = [:]
+    private var modelCatalogCache: [String: CachedModelCatalog] = [:]
+    private var launchdLabelsCache: [String: CachedLaunchdLabels] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        _ = mainWindowController
+
         if let button = statusItem.button {
             button.imagePosition = .noImage
             button.title = "Claw"
@@ -20,6 +215,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
 
         statusItem.menu = loadingMenu()
+        showMainWindow(route: .overview)
 
         // Let the app enter the menu bar first, then do the heavier refresh work.
         DispatchQueue.main.async { [weak self] in
@@ -29,6 +225,15 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         refreshTimer?.invalidate()
+    }
+
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
+        true
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showMainWindow(route: workspaceModel.route)
+        return true
     }
 
     private func finishLaunchingRefresh() {
@@ -55,21 +260,36 @@ final class AppController: NSObject, NSApplicationDelegate {
     @discardableResult
     private func refreshUI() -> [InstanceReport] {
         let reports = supervisor.reports()
+        currentReports = reports
+        currentReportsByID = Dictionary(uniqueKeysWithValues: reports.map { ($0.id, $0) })
         let title = menuBarTitle(for: reports)
 
         statusItem.button?.imagePosition = .noImage
         statusItem.button?.image = nil
         statusItem.button?.title = title
         statusItem.button?.toolTip = tooltip(for: reports)
-        statusItem.menu = buildMenu(reports: reports)
+        publishWorkspaceSnapshot(reports: reports)
+        if isMenuOpen {
+            needsMenuRefreshAfterClose = true
+        } else {
+            statusItem.menu = buildMenu(reports: reports)
+            presentCrashAlertsIfNeeded(reports: reports)
+        }
         return reports
     }
 
     private func loadingMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.delegate = self
         let loading = NSMenuItem(title: "正在初始化…", action: nil, keyEquivalent: "")
         loading.isEnabled = false
         menu.addItem(loading)
+        menu.addItem(NSMenuItem.separator())
+
+        let openMainWindow = NSMenuItem(title: "打开 OpenClaw 小助手", action: #selector(openMainWindow), keyEquivalent: "")
+        openMainWindow.target = self
+        menu.addItem(openMainWindow)
+
         menu.addItem(NSMenuItem.separator())
 
         let quit = NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -80,74 +300,30 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private func buildMenu(reports: [InstanceReport]) -> NSMenu {
         let menu = NSMenu()
+        menu.delegate = self
 
         let runningCount = reports.filter { $0.status == .running }.count
         let header = NSMenuItem(title: "OpenClaw 小助手  已运行 \(runningCount)/\(reports.count)", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 
+        let openMainWindow = NSMenuItem(title: "打开 OpenClaw 小助手", action: #selector(openMainWindow), keyEquivalent: "")
+        openMainWindow.target = self
+        menu.addItem(openMainWindow)
+
         let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
 
-        let fullScanItem = NSMenuItem(title: "全量扫描仓库", action: #selector(fullRescanRepositories), keyEquivalent: "")
-        fullScanItem.target = self
-        menu.addItem(fullScanItem)
-
         menu.addItem(NSMenuItem.separator())
 
-        let startAll = NSMenuItem(title: "启动全部龙虾", action: #selector(startAllInstances), keyEquivalent: "")
+        let startAll = NSMenuItem(title: "启动全部 OpenClaw", action: #selector(startAllInstances), keyEquivalent: "")
         startAll.target = self
         menu.addItem(startAll)
 
-        let restartAll = NSMenuItem(title: "重启全部龙虾", action: #selector(restartAllInstances), keyEquivalent: "")
-        restartAll.target = self
-        menu.addItem(restartAll)
-
-        let stopAll = NSMenuItem(title: "停止全部龙虾", action: #selector(stopAllInstances), keyEquivalent: "")
+        let stopAll = NSMenuItem(title: "停止全部 OpenClaw", action: #selector(stopAllInstances), keyEquivalent: "")
         stopAll.target = self
         menu.addItem(stopAll)
-
-        menu.addItem(NSMenuItem.separator())
-
-        if reports.isEmpty {
-            let empty = NSMenuItem(title: "没发现 OpenClaw 实例，先去编辑配置。", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            menu.addItem(empty)
-        } else {
-            for report in reports {
-                menu.addItem(instanceMenuItem(for: report))
-            }
-        }
-
-        menu.addItem(NSMenuItem.separator())
-
-        let editConfig = NSMenuItem(title: "编辑实例配置", action: #selector(openConfigFile), keyEquivalent: ",")
-        editConfig.target = self
-        menu.addItem(editConfig)
-
-        let openSupport = NSMenuItem(title: "打开运行目录", action: #selector(openSupportDirectory), keyEquivalent: "")
-        openSupport.target = self
-        menu.addItem(openSupport)
-
-        menu.addItem(NSMenuItem.separator())
-
-        let configuration = store.loadConfiguration()
-        menu.addItem(toggleMenuItem(
-            title: "开机自动启动小助手",
-            enabled: configuration.launchAtLogin,
-            action: #selector(toggleLaunchAtLogin)
-        ))
-        menu.addItem(toggleMenuItem(
-            title: "打开小助手时自动启动 OpenClaw",
-            enabled: configuration.autoStartInstancesOnLaunch,
-            action: #selector(toggleAutoStartInstancesOnLaunch)
-        ))
-        menu.addItem(toggleMenuItem(
-            title: "实例崩溃后自动重新拉起",
-            enabled: configuration.autoRestartCrashedInstances,
-            action: #selector(toggleAutoRestartCrashedInstances)
-        ))
 
         menu.addItem(NSMenuItem.separator())
 
@@ -184,6 +360,27 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         if let note = report.instance.notes, !note.isEmpty {
             submenu.addItem(disabledItem("备注: \(note)"))
+        }
+
+        if let modelsMenuItem = agentModelsActionItem(for: report) {
+            submenu.addItem(NSMenuItem.separator())
+            submenu.addItem(modelsMenuItem)
+        }
+
+        if report.status == .crashed,
+           let guidance = crashGuidance(for: report) {
+            submenu.addItem(NSMenuItem.separator())
+            submenu.addItem(disabledItem("原因: \(guidance.summary)"))
+            if let suggestion = guidance.suggestion, !suggestion.isEmpty {
+                submenu.addItem(disabledItem("建议: \(suggestion)"))
+            }
+
+            if let configFileURL = guidance.configFileURL {
+                let openConfig = NSMenuItem(title: "打开配置文件", action: #selector(openCrashConfigFile(_:)), keyEquivalent: "")
+                openConfig.target = self
+                openConfig.representedObject = configFileURL.path
+                submenu.addItem(openConfig)
+            }
         }
 
         submenu.addItem(NSMenuItem.separator())
@@ -376,8 +573,30 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshTimerFired(_ timer: Timer) {
+        guard workspaceModel.modelSheet == nil else {
+            return
+        }
         let reports = refreshUI()
         handleAutomaticRecovery(reports: reports)
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        isMenuOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isMenuOpen = false
+        guard needsMenuRefreshAfterClose else {
+            return
+        }
+
+        needsMenuRefreshAfterClose = false
+        let reports = refreshUI()
+        handleAutomaticRecovery(reports: reports)
+    }
+
+    @objc private func openMainWindow() {
+        showMainWindow(route: workspaceModel.route)
     }
 
     @objc private func fullRescanRepositories() {
@@ -387,23 +606,15 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleLaunchAtLogin() {
-        updateAutomationSetting(title: "开机自启动") { configuration in
-            configuration.launchAtLogin.toggle()
-        } afterSave: { configuration in
-            try LaunchAtLoginManager.sync(enabled: configuration.launchAtLogin)
-        }
+        setLaunchAtLogin(!store.loadConfiguration().launchAtLogin)
     }
 
     @objc private func toggleAutoStartInstancesOnLaunch() {
-        updateAutomationSetting(title: "自动启动 OpenClaw") { configuration in
-            configuration.autoStartInstancesOnLaunch.toggle()
-        }
+        setAutoStartInstancesOnLaunch(!store.loadConfiguration().autoStartInstancesOnLaunch)
     }
 
     @objc private func toggleAutoRestartCrashedInstances() {
-        updateAutomationSetting(title: "自动保活") { configuration in
-            configuration.autoRestartCrashedInstances.toggle()
-        }
+        setAutoRestartCrashedInstances(!store.loadConfiguration().autoRestartCrashedInstances)
     }
 
     @objc private func startAllInstances() {
@@ -444,6 +655,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         openManagementPage(forInstanceID: instanceID)
     }
 
+    @objc private func openAgentModelPicker(_ sender: NSMenuItem) {
+        guard let instanceID = sender.representedObject as? String else { return }
+        openAgentModelSheet(forInstanceID: instanceID)
+    }
+
+    @objc private func openCrashConfigFile(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
+
     @objc private func removeInstance(_ sender: NSMenuItem) {
         guard let instanceID = sender.representedObject as? String else { return }
         removeInstance(withID: instanceID)
@@ -471,6 +692,42 @@ final class AppController: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(url)
     }
 
+    private func openLogFile(forInstanceID instanceID: String) {
+        guard let report = report(forInstanceID: instanceID) else {
+            presentErrorAlert(title: "打开日志", message: "未找到实例：\(instanceID)")
+            return
+        }
+
+        let path = report.logFileURL.path
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
+        NSWorkspace.shared.open(report.logFileURL)
+    }
+
+    private func openConfigFile(forInstanceID instanceID: String) {
+        guard let report = report(forInstanceID: instanceID) else {
+            presentErrorAlert(title: "打开配置文件", message: "未找到实例：\(instanceID)")
+            return
+        }
+
+        guard let configURL = agentModelManager.configURLIfAvailable(for: report.instance) else {
+            presentErrorAlert(title: "打开配置文件", message: "没有识别到 \(report.instance.name) 的配置文件。")
+            return
+        }
+
+        NSWorkspace.shared.open(configURL)
+    }
+
+    private func openRepoFolder(forInstanceID instanceID: String) {
+        guard let report = report(forInstanceID: instanceID) else {
+            presentErrorAlert(title: "打开项目文件夹", message: "未找到实例：\(instanceID)")
+            return
+        }
+
+        NSWorkspace.shared.open(URL(fileURLWithPath: report.instance.expandedRepoPath))
+    }
+
     private func startInstance(withID instanceID: String) {
         executeAction("启动实例") {
             try supervisor.start(instanceID: instanceID)
@@ -490,7 +747,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func openManagementPage(forInstanceID instanceID: String) {
-        guard let report = supervisor.reports().first(where: { $0.instance.id == instanceID }) else {
+        guard let report = report(forInstanceID: instanceID) else {
             presentErrorAlert(title: "打开管理页", message: "未找到实例：\(instanceID)")
             return
         }
@@ -503,8 +760,61 @@ final class AppController: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(url)
     }
 
+    private func openAgentModelSheet(forInstanceID instanceID: String) {
+        guard let report = report(forInstanceID: instanceID) else {
+            presentErrorAlert(title: "切换模型", message: "未找到实例：\(instanceID)")
+            return
+        }
+
+        do {
+            let catalog = try modelCatalog(for: report.instance)
+            guard !catalog.agents.isEmpty else {
+                presentErrorAlert(title: "切换模型", message: "这个实例没有识别到可切换的智能体。")
+                return
+            }
+            workspaceModel.presentModelSheet(
+                AssistantModelSheetState(instanceID: report.instance.id, catalog: catalog)
+            )
+            showMainWindow(route: .instanceDetail(report.instance.id))
+        } catch {
+            presentErrorAlert(title: "切换模型失败", message: error.localizedDescription)
+        }
+    }
+
+    private func switchAgentModels(
+        instanceID: String,
+        assignments: [String: String],
+        restartIfRunning: Bool
+    ) {
+        guard let report = report(forInstanceID: instanceID) else {
+            presentErrorAlert(title: "切换模型", message: "未找到实例：\(instanceID)")
+            return
+        }
+
+        do {
+            let existingCatalog = try modelCatalog(for: report.instance)
+            let changedAssignments = assignments.filter { agentID, modelID in
+                existingCatalog.agents.first(where: { $0.agentID == agentID })?.currentModelID != modelID
+            }
+            if changedAssignments.isEmpty {
+                return
+            }
+
+            _ = try agentModelManager.setPrimaryModels(changedAssignments, in: report.instance)
+            invalidateModelCatalog(forInstanceID: instanceID)
+            if restartIfRunning && (report.status == .running || report.status == .starting) {
+                try supervisor.restart(instanceID: instanceID)
+            }
+
+            let refreshedReports = refreshUI()
+            handleAutomaticRecovery(reports: refreshedReports)
+        } catch {
+            presentErrorAlert(title: "切换模型失败", message: error.localizedDescription)
+        }
+    }
+
     private func removeInstance(withID instanceID: String) {
-        guard let report = supervisor.reports().first(where: { $0.instance.id == instanceID }) else {
+        guard let report = report(forInstanceID: instanceID) else {
             presentErrorAlert(title: "移除实例", message: "未找到实例：\(instanceID)")
             return
         }
@@ -535,6 +845,21 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func agentModelsActionItem(for report: InstanceReport) -> NSMenuItem? {
+        guard let catalog = try? modelCatalog(for: report.instance) else {
+            return nil
+        }
+
+        if catalog.agents.isEmpty {
+            return disabledItem("智能体编组：未识别到可切换智能体")
+        }
+
+        let item = NSMenuItem(title: "打开智能体编组…", action: #selector(openAgentModelPicker(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = report.instance.id
+        return item
+    }
+
     private func updateAutomationSetting(
         title: String,
         mutate: (inout AssistantConfiguration) -> Void,
@@ -549,6 +874,252 @@ final class AppController: NSObject, NSApplicationDelegate {
             handleAutomaticRecovery(reports: reports)
         } catch {
             presentErrorAlert(title: title, message: error.localizedDescription)
+        }
+    }
+
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        updateAutomationSetting(title: "开机自启动") { configuration in
+            configuration.launchAtLogin = enabled
+        } afterSave: { configuration in
+            try LaunchAtLoginManager.sync(enabled: configuration.launchAtLogin)
+        }
+    }
+
+    private func setAutoStartInstancesOnLaunch(_ enabled: Bool) {
+        updateAutomationSetting(title: "自动启动 OpenClaw") { configuration in
+            configuration.autoStartInstancesOnLaunch = enabled
+        }
+    }
+
+    private func setAutoRestartCrashedInstances(_ enabled: Bool) {
+        updateAutomationSetting(title: "自动保活") { configuration in
+            configuration.autoRestartCrashedInstances = enabled
+        }
+    }
+
+    private func restoreIgnoredRepoPath(_ path: String) {
+        executeAction("恢复忽略仓库") {
+            try store.restoreIgnoredRepoPath(path)
+        }
+    }
+
+    private func report(forInstanceID instanceID: String) -> InstanceReport? {
+        if let report = currentReportsByID[instanceID] {
+            return report
+        }
+
+        let refreshedReports = supervisor.reports()
+        currentReports = refreshedReports
+        currentReportsByID = Dictionary(uniqueKeysWithValues: refreshedReports.map { ($0.id, $0) })
+        return currentReportsByID[instanceID]
+    }
+
+    private func cachedLaunchdLabels(for instanceID: String) -> [String] {
+        let now = Date()
+        if let cached = launchdLabelsCache[instanceID],
+           now.timeIntervalSince(cached.fetchedAt) < 30 {
+            return cached.labels
+        }
+
+        let labels = supervisor.managedLaunchdLabels(for: instanceID)
+        launchdLabelsCache[instanceID] = CachedLaunchdLabels(labels: labels, fetchedAt: now)
+        return labels
+    }
+
+    private func snapshotManagementURL(for report: InstanceReport) -> URL? {
+        guard let port = configuredManagementPort(for: report.instance) else {
+            return nil
+        }
+        return URL(string: "http://127.0.0.1:\(port)")
+    }
+
+    private func cachedModelCatalog(for instance: OpenClawInstance) throws -> CachedModelCatalog {
+        guard let configURL = agentModelManager.configURLIfAvailable(for: instance) else {
+            throw NSError(domain: "OpenClawAssistant", code: 404, userInfo: [
+                NSLocalizedDescriptionKey: "没找到 \(instance.name) 的 openclaw.json 配置文件。"
+            ])
+        }
+
+        let modifiedAt = (try? FileManager.default.attributesOfItem(atPath: configURL.path)[.modificationDate] as? Date) ?? nil
+        if let cached = modelCatalogCache[instance.id],
+           cached.configURL.path == configURL.path,
+           cached.modifiedAt == modifiedAt {
+            return cached
+        }
+
+        let catalog = try agentModelManager.catalog(for: instance)
+        let cached = CachedModelCatalog(
+            configURL: catalog.configURL,
+            modifiedAt: modifiedAt,
+            catalog: catalog,
+            summary: modelSummary(for: catalog)
+        )
+        modelCatalogCache[instance.id] = cached
+        return cached
+    }
+
+    private func modelCatalog(for instance: OpenClawInstance) throws -> OpenClawInstanceModelCatalog {
+        try cachedModelCatalog(for: instance).catalog
+    }
+
+    private func invalidateModelCatalog(forInstanceID instanceID: String) {
+        modelCatalogCache.removeValue(forKey: instanceID)
+    }
+
+    private func showMainWindow(route: AssistantRoute) {
+        workspaceModel.show(route: route)
+        mainWindowController.reveal()
+    }
+
+    private func publishWorkspaceSnapshot(reports: [InstanceReport]) {
+        let configuration = store.loadConfiguration()
+
+        var managementURLs: [String: URL] = [:]
+        var configURLs: [String: URL] = [:]
+        var modelSummaries: [String: String] = [:]
+        var managedLaunchdLabels: [String: [String]] = [:]
+
+        for report in reports {
+            if let managementURL = snapshotManagementURL(for: report) {
+                managementURLs[report.id] = managementURL
+            }
+
+            if let cachedCatalog = try? cachedModelCatalog(for: report.instance) {
+                configURLs[report.id] = cachedCatalog.configURL
+                modelSummaries[report.id] = cachedCatalog.summary
+            }
+
+            let labels = cachedLaunchdLabels(for: report.id)
+            if !labels.isEmpty {
+                managedLaunchdLabels[report.id] = labels
+            }
+        }
+
+        let attentionItems = buildAttentionItems(
+            reports: reports,
+            configuration: configuration,
+            configURLsByInstanceID: configURLs,
+            managedLaunchdLabelsByInstanceID: managedLaunchdLabels
+        )
+
+        workspaceModel.apply(
+            snapshot: AssistantWorkspaceSnapshot(
+                reports: reports,
+                configuration: configuration,
+                attentionItems: attentionItems,
+                managementURLsByInstanceID: managementURLs,
+                configURLsByInstanceID: configURLs,
+                modelSummaryByInstanceID: modelSummaries,
+                managedLaunchdLabelsByInstanceID: managedLaunchdLabels,
+                generatedAt: Date()
+            )
+        )
+    }
+
+    private func modelSummary(for catalog: OpenClawInstanceModelCatalog) -> String {
+        let currentModels = catalog.agents.compactMap(\.currentModelID)
+        guard let firstModel = currentModels.first else {
+            return "\(catalog.agents.count) 个智能体"
+        }
+
+        if catalog.agents.count == 1 {
+            return firstModel
+        }
+
+        return "\(catalog.agents.count) 个智能体 · \(firstModel)"
+    }
+
+    private func buildAttentionItems(
+        reports: [InstanceReport],
+        configuration: AssistantConfiguration,
+        configURLsByInstanceID: [String: URL],
+        managedLaunchdLabelsByInstanceID: [String: [String]]
+    ) -> [AssistantAttentionItem] {
+        var items: [AssistantAttentionItem] = []
+
+        for report in reports {
+            if report.status == .crashed {
+                let guidance = crashGuidance(for: report)
+                items.append(
+                    AssistantAttentionItem(
+                        id: "crash:\(report.id):\(crashSignature(for: report, guidance: guidance))",
+                        severity: .critical,
+                        title: "\(report.instance.name) 已崩溃",
+                        summary: guidance?.summary ?? summarizedCrashReason(for: report),
+                        detail: crashAlertMessage(for: report, guidance: guidance),
+                        timestamp: report.runtime.lastCrashedAt ?? report.lastActivityAt,
+                        instanceID: report.id,
+                        configURL: guidance?.configFileURL ?? configURLsByInstanceID[report.id],
+                        logURL: report.logFileURL,
+                        repoPath: report.instance.expandedRepoPath,
+                        ignoredRepoPath: nil,
+                        launchdLabels: managedLaunchdLabelsByInstanceID[report.id] ?? []
+                    )
+                )
+            }
+
+            if report.status == .missingProject {
+                items.append(
+                    AssistantAttentionItem(
+                        id: "missing:\(report.id)",
+                        severity: .warning,
+                        title: "\(report.instance.name) 项目不可用",
+                        summary: "当前路径不存在可运行的 OpenClaw 项目。",
+                        detail: "仓库路径 \(report.instance.repoPath) 目前不可用，启动和重启操作都会失败。先确认目录是否还在，或者从列表里移除它。",
+                        timestamp: report.lastActivityAt,
+                        instanceID: report.id,
+                        configURL: configURLsByInstanceID[report.id],
+                        logURL: report.logFileURL,
+                        repoPath: report.instance.expandedRepoPath,
+                        ignoredRepoPath: nil,
+                        launchdLabels: []
+                    )
+                )
+            }
+
+            if let labels = managedLaunchdLabelsByInstanceID[report.id], !labels.isEmpty {
+                items.append(
+                    AssistantAttentionItem(
+                        id: "launchd:\(report.id)",
+                        severity: .info,
+                        title: "\(report.instance.name) 由系统托管",
+                        summary: "启动和停止会同时接管对应的 LaunchAgent。",
+                        detail: "这个实例背后有 launchd 服务在保活。你在小助手里执行启动和停止时，我会同步处理这些托管服务，避免看起来像“点了没反应”。",
+                        timestamp: report.runtime.lastStartedAt,
+                        instanceID: report.id,
+                        configURL: configURLsByInstanceID[report.id],
+                        logURL: report.logFileURL,
+                        repoPath: report.instance.expandedRepoPath,
+                        ignoredRepoPath: nil,
+                        launchdLabels: labels
+                    )
+                )
+            }
+        }
+
+        for path in configuration.ignoredRepoPaths {
+            items.append(
+                AssistantAttentionItem(
+                    id: "ignored:\(path)",
+                    severity: .info,
+                    title: "有仓库被放进忽略列表",
+                    summary: path,
+                    detail: "这个仓库已经被记录到忽略列表，平时自动扫描不会再把它加回来。你可以在这里恢复，或者之后执行全量扫描。",
+                    timestamp: nil,
+                    instanceID: nil,
+                    configURL: nil,
+                    logURL: nil,
+                    repoPath: nil,
+                    ignoredRepoPath: path,
+                    launchdLabels: []
+                )
+            )
+        }
+
+        return items.sorted { lhs, rhs in
+            let lhsDate = lhs.timestamp ?? .distantPast
+            let rhsDate = rhs.timestamp ?? .distantPast
+            return lhsDate > rhsDate
         }
     }
 
@@ -649,6 +1220,209 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private func logMaintenanceError(_ title: String, error: Error) {
         FileHandle.standardError.write(Data("[OpenClawAssistant] \(title): \(error.localizedDescription)\n".utf8))
+    }
+
+    private func presentCrashAlertsIfNeeded(reports: [InstanceReport]) {
+        for report in reports {
+            switch report.status {
+            case .running, .stopped, .missingProject, .disabled:
+                alertingCrashInstances.remove(report.id)
+            case .starting:
+                continue
+            case .crashed:
+                let guidance = crashGuidance(for: report)
+                let signature = crashSignature(for: report, guidance: guidance)
+                guard !alertingCrashInstances.contains(report.id) else {
+                    continue
+                }
+                guard acknowledgedCrashSignatures[report.id] != signature else {
+                    continue
+                }
+                alertingCrashInstances.insert(report.id)
+                presentCrashAlert(for: report, guidance: guidance, signature: signature)
+            }
+        }
+    }
+
+    private func presentCrashAlert(for report: InstanceReport, guidance: CrashGuidance?, signature: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "\(report.instance.name) 已崩溃"
+        alert.informativeText = crashAlertMessage(for: report, guidance: guidance)
+
+        defer {
+            acknowledgedCrashSignatures[report.id] = signature
+            alertingCrashInstances.remove(report.id)
+        }
+
+        if let configFileURL = guidance?.configFileURL {
+            alert.addButton(withTitle: "打开配置文件")
+            alert.addButton(withTitle: "打开日志")
+            alert.addButton(withTitle: "知道了")
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(configFileURL)
+            }
+            if response == .alertSecondButtonReturn {
+                NSWorkspace.shared.open(report.logFileURL)
+            }
+            return
+        }
+
+        alert.addButton(withTitle: "打开日志")
+        alert.addButton(withTitle: "知道了")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(report.logFileURL)
+        }
+    }
+
+    private func crashSignature(for report: InstanceReport, guidance: CrashGuidance?) -> String {
+        let basis = guidance?.summary
+            ?? report.recentLogLine
+            ?? summarizedCrashReason(for: report)
+        let normalizedBasis = basis.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (normalizedBasis.isEmpty ? report.status.label : normalizedBasis)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    private func crashAlertMessage(for report: InstanceReport, guidance: CrashGuidance?) -> String {
+        let reason = guidance?.summary ?? summarizedCrashReason(for: report)
+        var lines = ["实例启动后又退出了。"]
+
+        if !reason.isEmpty {
+            lines.append("原因：\(reason)")
+        }
+
+        if let suggestion = guidance?.suggestion, !suggestion.isEmpty {
+            lines.append("建议：\(suggestion)")
+        } else if let recentLogLine = report.recentLogLine, !recentLogLine.isEmpty {
+            lines.append("最近日志：\(recentLogLine)")
+        }
+
+        if store.loadConfiguration().autoRestartCrashedInstances {
+            lines.append("自动保活已开启，小助手会继续尝试重新拉起它。")
+        }
+
+        lines.append("日志文件：\(report.logFileURL.path)")
+        return lines.joined(separator: "\n")
+    }
+
+    private func crashGuidance(for report: InstanceReport) -> CrashGuidance? {
+        let lines = FileSystem.lastNonEmptyLines(in: report.logFileURL, limit: 40)
+        let extractedConfigFilePath = extractedConfigFilePath(from: lines)
+        let inferredConfigFileURL = inferredConfigFileURL(
+            for: report.instance,
+            extractedPath: extractedConfigFilePath
+        )
+        let configFilePath = extractedConfigFilePath ?? inferredConfigFileURL?.path
+
+        if let configFilePath {
+            return CrashGuidance(
+                summary: "配置文件不兼容：\(configFilePath)",
+                suggestion: "先打开配置文件和日志，把报错交给其他工具处理。",
+                configFileURL: inferredConfigFileURL
+            )
+        }
+
+        if lines.contains(where: { $0.localizedCaseInsensitiveContains("doctor --fix") }) {
+            return CrashGuidance(
+                summary: summarizedCrashReason(for: report),
+                suggestion: "先打开日志定位问题，再把这条报错交给其他工具处理。",
+                configFileURL: inferredConfigFileURL
+            )
+        }
+
+        let recent = report.recentLogLine ?? lines.first ?? "实例启动后立即退出，可能是配置不兼容或运行环境问题。"
+
+        return CrashGuidance(
+            summary: recent,
+            suggestion: inferredConfigFileURL == nil
+                ? "先打开日志查看最近错误，再决定是否要调整实例配置。"
+                : "先打开配置文件和日志，把报错交给其他工具处理。",
+            configFileURL: inferredConfigFileURL
+        )
+    }
+
+    private func summarizedCrashReason(for report: InstanceReport) -> String {
+        let lines = FileSystem.lastNonEmptyLines(in: report.logFileURL, limit: 20)
+
+        if let configLine = lines.first(where: {
+            $0.localizedCaseInsensitiveContains("invalid config at") ||
+            $0.localizedCaseInsensitiveContains("config invalid")
+        }) {
+            return configLine
+        }
+
+        if let doctorLine = lines.first(where: {
+            $0.localizedCaseInsensitiveContains("doctor --fix")
+        }) {
+            return doctorLine
+        }
+
+        return report.recentLogLine ?? ""
+    }
+
+    private func extractedConfigFilePath(from lines: [String]) -> String? {
+        for line in lines {
+            if let path = firstMatch(in: line, pattern: #"Invalid config at\s+([^:]+):"#) {
+                return path
+            }
+            if let path = firstMatch(in: line, pattern: #"File:\s+(.+openclaw\.json)"#) {
+                return path
+            }
+        }
+        return nil
+    }
+
+    private func inferredConfigFileURL(for instance: OpenClawInstance, extractedPath: String?) -> URL? {
+        let explicitPath: String?
+        if let extractedPath, !extractedPath.isEmpty {
+            explicitPath = extractedPath
+        } else if let envPath = instance.env["OPENCLAW_CONFIG_PATH"], !envPath.isEmpty {
+            explicitPath = envPath
+        } else if let envPath = instance.env["CLAWDBOT_CONFIG_PATH"], !envPath.isEmpty {
+            explicitPath = envPath
+        } else {
+            explicitPath = nil
+        }
+
+        if let explicitPath {
+            let url = URL(fileURLWithPath: PathExpander.expand(explicitPath))
+            return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidate: URL
+        if let profile = inferredProfile(for: instance, configFilePath: nil), !profile.isEmpty {
+            candidate = home.appendingPathComponent(".openclaw-\(profile)/openclaw.json")
+        } else {
+            candidate = home.appendingPathComponent(".openclaw/openclaw.json")
+        }
+
+        return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+    }
+
+    private func inferredProfile(for instance: OpenClawInstance, configFilePath: String?) -> String? {
+        if let profileIndex = instance.startCommand.firstIndex(of: "--profile"),
+           instance.startCommand.indices.contains(profileIndex + 1) {
+            return instance.startCommand[profileIndex + 1]
+        }
+
+        if let profile = instance.env["OPENCLAW_PROFILE"], !profile.isEmpty {
+            return profile
+        }
+
+        guard let configFilePath else {
+            return nil
+        }
+
+        let expanded = PathExpander.expand(configFilePath)
+        let parent = URL(fileURLWithPath: expanded).deletingLastPathComponent().lastPathComponent
+        guard parent.hasPrefix(".openclaw-") else {
+            return nil
+        }
+        return String(parent.dropFirst(".openclaw-".count))
     }
 
     private func presentErrorAlert(title: String, message: String) {

@@ -8,6 +8,11 @@ final class InstanceSupervisor {
         let currentDirectory: String?
     }
 
+    private struct LaunchdService {
+        let label: String
+        let plistPath: String
+    }
+
     private let store: ConfigurationStore
     private var configuration: AssistantConfiguration
     private var runtime: RuntimeState
@@ -99,6 +104,17 @@ final class InstanceSupervisor {
             return
         }
 
+        if try startManagedLaunchdServicesIfPresent(for: instance) {
+            var nextRuntime = runtime.instances[instance.id] ?? .empty
+            nextRuntime.lastStartedAt = Date()
+            nextRuntime.lastStopWasManual = false
+            nextRuntime.lastExitCode = nil
+            nextRuntime.lastCrashedAt = nil
+            runtime.instances[instance.id] = nextRuntime
+            try store.save(runtime: runtime)
+            return
+        }
+
         let repoURL = URL(fileURLWithPath: instance.expandedRepoPath)
         let logURL = store.logURL(for: instance)
         if !FileManager.default.fileExists(atPath: logURL.path) {
@@ -159,6 +175,10 @@ final class InstanceSupervisor {
         runtime.instances[instanceID] = nextRuntime
         try store.save(runtime: runtime)
 
+        if let instance = configuration.instances.first(where: { $0.id == instanceID }) {
+            stopManagedLaunchdServices(for: instance)
+        }
+
         for pid in report.observedPIDs {
             _ = ProcessRunner.run(executable: "/bin/kill", arguments: ["-TERM", String(pid)])
         }
@@ -216,6 +236,17 @@ final class InstanceSupervisor {
         for instance in configuration.instances where !instance.disabled {
             try restart(instanceID: instance.id)
         }
+    }
+
+    func managedLaunchdLabels(for instanceID: String) -> [String] {
+        reloadConfiguration()
+        guard let instance = configuration.instances.first(where: { $0.id == instanceID }) else {
+            return []
+        }
+
+        let installed = installedLaunchdServices(matching: instance).map(\.label)
+        let loaded = loadedLaunchdServices(matching: instance).map(\.label)
+        return Array(Set(installed + loaded)).sorted()
     }
 
     private func resolveStatus(
@@ -478,6 +509,147 @@ final class InstanceSupervisor {
         if let data = try? encoder.encode(nextState) {
             try? data.write(to: runtimeURL, options: .atomic)
         }
+    }
+
+    private func startManagedLaunchdServicesIfPresent(for instance: OpenClawInstance) throws -> Bool {
+        let services = installedLaunchdServices(matching: instance)
+        guard !services.isEmpty else {
+            return false
+        }
+
+        let domain = launchdDomain()
+        var startedAny = false
+
+        for service in services {
+            _ = runLaunchctl(arguments: ["enable", "\(domain)/\(service.label)"])
+            _ = runLaunchctl(arguments: ["bootstrap", domain, service.plistPath])
+            let result = runLaunchctl(arguments: ["kickstart", "-k", "\(domain)/\(service.label)"])
+            if result.exitCode == 0 {
+                startedAny = true
+            }
+        }
+
+        return startedAny
+    }
+
+    private func stopManagedLaunchdServices(for instance: OpenClawInstance) {
+        let services = loadedLaunchdServices(matching: instance)
+        guard !services.isEmpty else {
+            return
+        }
+
+        let domain = launchdDomain()
+        for service in services {
+            _ = runLaunchctl(arguments: ["bootout", domain, service.plistPath])
+            _ = runLaunchctl(arguments: ["disable", "\(domain)/\(service.label)"])
+        }
+    }
+
+    private func installedLaunchdServices(matching instance: OpenClawInstance) -> [LaunchdService] {
+        let agentsDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents")
+
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: agentsDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        let repoPath = standardizedPath(instance.expandedRepoPath)
+        var matched: [LaunchdService] = []
+
+        for file in files where file.pathExtension == "plist" {
+            let plistPath = file.path
+            let result = ProcessRunner.run(
+                executable: "/usr/bin/plutil",
+                arguments: ["-p", plistPath]
+            )
+            guard result.exitCode == 0 else {
+                continue
+            }
+
+            let lowered = result.stdout.lowercased()
+            guard lowered.contains(repoPath) else {
+                continue
+            }
+
+            guard let label = firstMatch(in: result.stdout, pattern: #""Label"\s*=>\s*"([^"]+)""#),
+                  !label.isEmpty else {
+                continue
+            }
+
+            matched.append(LaunchdService(label: label, plistPath: plistPath))
+        }
+
+        return matched
+    }
+
+    private func loadedLaunchdServices(matching instance: OpenClawInstance) -> [LaunchdService] {
+        let list = runLaunchctl(arguments: ["list"])
+        guard list.exitCode == 0 else {
+            return []
+        }
+
+        let labels = list.stdout
+            .split(separator: "\n")
+            .compactMap { line -> String? in
+                let parts = line
+                    .split(separator: "\t")
+                    .map(String.init)
+                guard let label = parts.last?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !label.isEmpty else {
+                    return nil
+                }
+                return label
+            }
+            .filter { $0.localizedCaseInsensitiveContains("openclaw") || $0.localizedCaseInsensitiveContains("claw") }
+
+        let domain = launchdDomain()
+        let repoPath = standardizedPath(instance.expandedRepoPath)
+        var services: [LaunchdService] = []
+
+        for label in labels {
+            let printed = runLaunchctl(arguments: ["print", "\(domain)/\(label)"])
+            guard printed.exitCode == 0 else {
+                continue
+            }
+
+            let lowered = printed.stdout.lowercased()
+            guard lowered.contains(repoPath) else {
+                continue
+            }
+
+            if let plistPath = firstMatch(in: printed.stdout, pattern: #"(?m)^\s*path = (.+)$"#)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !plistPath.isEmpty {
+                services.append(LaunchdService(label: label, plistPath: plistPath))
+            }
+        }
+
+        return services
+    }
+
+    private func runLaunchctl(arguments: [String]) -> ProcessRunner.Result {
+        ProcessRunner.run(executable: "/bin/launchctl", arguments: arguments)
+    }
+
+    private func launchdDomain() -> String {
+        "gui/\(getuid())"
+    }
+
+    private func firstMatch(in text: String, pattern: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              match.numberOfRanges > 1,
+              let valueRange = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+        return String(text[valueRange])
     }
 }
 
