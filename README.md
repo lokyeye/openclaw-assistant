@@ -10,8 +10,6 @@
 - 不同实例使用不同端口、不同 profile、不同仓库目录
 - 需要从菜单栏快速看状态、重启实例、打开控制页
 
-![OpenClaw 小助手菜单截图](docs/images/openclaw-assistant-menu.png)
-
 ## 现在支持什么
 
 - 菜单栏实时显示运行数量
@@ -111,9 +109,9 @@ cd ~/Desktop/openclaw小助手
   "ignoredRepoPaths": [],
   "instances": [
     {
-      "id": "nexus-link",
-      "name": "Nexus Link",
-      "repoPath": "/Users/lok/Desktop/Nexus Link/openclaw",
+      "id": "studio-openclaw",
+      "name": "Studio OpenClaw",
+      "repoPath": "/Users/yourname/Desktop/openclaw",
       "startCommand": [
         "node",
         "scripts/run-node.mjs",

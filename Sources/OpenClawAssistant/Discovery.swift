@@ -252,10 +252,10 @@ enum OpenClawDiscovery {
 
     private static func fallbackCandidates(in home: URL) -> [URL] {
         [
-            home.appendingPathComponent("Desktop/Nexus Link/openclaw"),
+            home.appendingPathComponent("Desktop/openclaw"),
+            home.appendingPathComponent("Desktop/openclaw-cn"),
             home.appendingPathComponent("Desktop/OpenclawCn"),
             home.appendingPathComponent("Desktop/openclaw-china"),
-            home.appendingPathComponent("Desktop/猫动游戏公司"),
         ]
     }
 
