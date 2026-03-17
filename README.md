@@ -1,6 +1,12 @@
 # OpenClaw 小助手
 
-一个原生 Swift 实现的 macOS 菜单栏助手，用来统一发现、监控和控制本机上的多套 OpenClaw / openclaw-cn 实例。
+一个原生 Swift 实现的 macOS 助手，用来统一发现、监控和控制本机上的多套 OpenClaw / openclaw-cn 实例。
+
+它现在不是单纯的“菜单栏小工具”了，而是一个 `菜单栏 + Dock + 桌面主窗口` 的控制台：
+
+- 菜单栏负责快速看状态和做轻操作
+- 桌面主窗口负责总览、实例详情、提醒中心、设置
+- 智能体 / 模型编组有单独的可缩放工作台，不再挤在二级菜单里
 
 更新日志见 [CHANGELOG.md](./CHANGELOG.md)。
 
@@ -8,26 +14,62 @@
 
 - 同一台 Mac 上同时跑多套 OpenClaw
 - 不同实例使用不同端口、不同 profile、不同仓库目录
-- 需要从菜单栏快速看状态、重启实例、打开控制页
+- 需要同时用 GUI 和 CLI 管理实例
+- 需要稳定处理 launchd 托管实例、崩溃重启、忽略列表和重新发现
 
 ## 现在支持什么
 
+### 桌面 UI
+
 - 菜单栏实时显示运行数量
+- Dock + 桌面主窗口双入口
+- 桌面主窗口包含：
+  - `总览`
+  - `实例详情`
+  - `提醒中心`
+  - `设置`
 - 实例前置状态圆点
   - 绿色：运行中 / 启动中
   - 红色：停止 / 崩溃 / 项目缺失 / 禁用
+- 快速打开实例项目目录、日志文件、配置文件、控制管理页
+
+### 智能体 / 模型编组
+
+- 独立的智能体 / 模型编组工作台
+- 按模型来源 / 系列分组，而不是按用途硬拆
+- 当前默认分成 4 组：
+  - `OpenAI 系列`
+  - `百炼 / Bailian`
+  - `DashScope / SiliconFlow`
+  - `本地 / 私有 / 其他`
+- 支持点选暂存、多智能体批量编组、应用前复核
+- 支持可缩放窗口，内部布局会自适应
+- 每个模型来源卡都可以独立上下滚动，适合模型很多的供应商
+
+### 实例控制与发现
+
 - 单个实例启动、停止、重启
 - 全部实例启动、停止、重启
-- 快速打开实例项目目录、日志文件、控制管理页
-- 桌面主窗口：总览、实例详情、提醒中心、设置
-- 智能体 / 模型编组工作台
-- 自动发现桌面上的 `openclaw` / `openclaw-cn` 仓库
+- 自动发现正在运行的 OpenClaw 进程，并尽量反推 `--profile`、`--port`
+- 自动发现常见桌面仓库目录下的 `openclaw` / `openclaw-cn`
 - 可忽略不想再自动扫回来的实例
 - 手动触发全量扫描
-- CLI 控制接口
+- 支持 launchd 托管实例的启动 / 停止 / 重启，不再出现“点了没反应”
+
+### 自动化与提醒
+
 - 开机启动小助手
 - 打开小助手时自动启动 OpenClaw
 - 崩溃后自动保活拉起
+- 相同错误点一次“知道了”后不会重复弹
+- 提醒中心会汇总崩溃、忽略实例、launchd 托管状态等信息
+
+### CLI
+
+- CLI 控制接口
+- 支持查看实例状态、设置开关、全量扫描
+- 支持查看实例智能体 / 模型候选列表
+- 支持直接通过 CLI 修改某个智能体使用的模型
 
 ## 运行环境
 
@@ -58,6 +100,8 @@ open ./OpenClaw小助手.app
 ```bash
 cd ~/Desktop/openclaw小助手
 ./scripts/openclaw-assistant-cli status
+./scripts/openclaw-assistant-cli models <instance-id>
+./scripts/openclaw-assistant-cli set-model <instance-id> <agent-id> <model-id>
 ./scripts/openclaw-assistant-cli start <instance-id>
 ./scripts/openclaw-assistant-cli stop <instance-id>
 ./scripts/openclaw-assistant-cli restart <instance-id>
@@ -71,7 +115,9 @@ cd ~/Desktop/openclaw小助手
 支持的命令：
 
 - `status [instance-id]`
+- `models <instance-id>`
 - `settings`
+- `set-model <instance-id> <agent-id> <model-id>`
 - `start <instance-id>`
 - `stop <instance-id>`
 - `restart <instance-id>`
@@ -120,7 +166,7 @@ cd ~/Desktop/openclaw小助手
       ],
       "env": {},
       "processMatch": [
-        "OPENCLAW_ASSISTANT_INSTANCE_ID=nexus-link"
+        "OPENCLAW_ASSISTANT_INSTANCE_ID=studio-openclaw"
       ],
       "activityPaths": [
         "~/.openclaw/logs",
@@ -138,6 +184,7 @@ cd ~/Desktop/openclaw小助手
 - 其次读取仓库内的启动脚本
 - 再其次读取 `.env` 里的 `OPENCLAW_GATEWAY_PORT`
 - 对已经识别出的自定义启动参数，不会在后续自动刷新时被默认值覆盖
+- 对 launchd 托管的实例，会额外记录并同步处理对应服务标签
 
 ## 自动保活说明
 
@@ -156,6 +203,8 @@ cd ~/Desktop/openclaw小助手
 ## 目录结构
 
 - `Sources/OpenClawAssistant`: 主程序源码
+- `Sources/OpenClawAssistant/AssistantDesktopUI.swift`: 桌面主窗口与智能体编组 UI
+- `Sources/OpenClawAssistant/AgentModelManager.swift`: 智能体 / 模型读取与写回
 - `Resources`: `Info.plist`、图标资源
 - `scripts`: 打包与 CLI 脚本
 
