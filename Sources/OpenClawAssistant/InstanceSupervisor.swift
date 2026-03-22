@@ -13,9 +13,36 @@ final class InstanceSupervisor {
         let plistPath: String
     }
 
+    private struct CachedBranch {
+        let value: String?
+        let fetchedAt: Date
+    }
+
+    private struct CachedActivity {
+        let value: Date?
+        let fetchedAt: Date
+    }
+
+    private struct CachedWorkingDirectory {
+        let value: String?
+        let fetchedAt: Date
+    }
+
+    private struct CachedTextReferences {
+        let values: [String]
+        let fetchedAt: Date
+    }
+
     private let store: ConfigurationStore
     private var configuration: AssistantConfiguration
     private var runtime: RuntimeState
+    private var branchCache: [String: CachedBranch] = [:]
+    private var activityCache: [String: CachedActivity] = [:]
+    private var workingDirectoryCache: [Int32: CachedWorkingDirectory] = [:]
+    private var processReferenceCache: [Int32: CachedTextReferences] = [:]
+    private let branchCacheTTL: TimeInterval = 20
+    private let activityCacheTTL: TimeInterval = 10
+    private let processMetadataCacheTTL: TimeInterval = 10
 
     init(store: ConfigurationStore) {
         self.store = store
@@ -30,7 +57,8 @@ final class InstanceSupervisor {
 
     func reports() -> [InstanceReport] {
         reloadConfiguration()
-        let processes = observedProcesses()
+        let now = Date()
+        let processes = observedProcesses(now: now)
         var textReferenceCache: [Int32: [String]] = [:]
         var nextRuntime = runtime
         var didMutateRuntime = false
@@ -40,7 +68,7 @@ final class InstanceSupervisor {
             let repoPath = instance.expandedRepoPath
             let repoExists = repositoryLooksValid(for: instance)
             let observedPIDs = repoExists
-                ? matchingPIDs(for: instance, in: processes, textReferenceCache: &textReferenceCache)
+                ? matchingPIDs(for: instance, in: processes, textReferenceCache: &textReferenceCache, now: now)
                 : []
 
             let observedRuntimeState = synchronizedRuntimeState(
@@ -53,17 +81,24 @@ final class InstanceSupervisor {
                 didMutateRuntime = true
             }
 
-            let branch = repoExists ? currentGitBranch(for: repoPath) : nil
-            let lastActivity = FileSystem.latestModificationDate(
-                for: instance.activityPaths + [store.logURL(for: instance).path]
-            )
-            let recentLog = FileSystem.lastNonEmptyLine(in: store.logURL(for: instance))
-
+            let logURL = store.logURL(for: instance)
             let status = resolveStatus(
                 for: instance,
                 runtime: runtimeState,
                 repoExists: repoExists,
                 observedPIDs: observedPIDs
+            )
+
+            let branch = repoExists ? cachedGitBranch(for: repoPath, now: now) : nil
+            let lastActivity = cachedActivityDate(
+                for: instance.activityPaths + [logURL.path],
+                instanceID: instance.id,
+                now: now
+            )
+            let recentLog = recentLogLine(
+                in: logURL,
+                status: status,
+                runtime: runtimeState
             )
 
             return InstanceReport(
@@ -75,7 +110,7 @@ final class InstanceSupervisor {
                 repoBranch: branch,
                 lastActivityAt: lastActivity,
                 recentLogLine: recentLog,
-                logFileURL: store.logURL(for: instance)
+                logFileURL: logURL
             )
         }
 
@@ -85,6 +120,47 @@ final class InstanceSupervisor {
         }
 
         return reports
+    }
+
+    private func cachedGitBranch(for repoPath: String, now: Date) -> String? {
+        if let cached = branchCache[repoPath],
+           now.timeIntervalSince(cached.fetchedAt) < branchCacheTTL {
+            return cached.value
+        }
+
+        let value = currentGitBranch(for: repoPath)
+        branchCache[repoPath] = CachedBranch(value: value, fetchedAt: now)
+        return value
+    }
+
+    private func cachedActivityDate(
+        for paths: [String],
+        instanceID: String,
+        now: Date
+    ) -> Date? {
+        if let cached = activityCache[instanceID],
+           now.timeIntervalSince(cached.fetchedAt) < activityCacheTTL {
+            return cached.value
+        }
+
+        let value = FileSystem.latestModificationDate(for: paths)
+        activityCache[instanceID] = CachedActivity(value: value, fetchedAt: now)
+        return value
+    }
+
+    private func recentLogLine(
+        in logURL: URL,
+        status: InstanceStatus,
+        runtime: InstanceRuntimeState
+    ) -> String? {
+        if status == .running || status == .starting,
+           let startedAt = runtime.lastStartedAt,
+           let modifiedAt = FileSystem.modificationDate(for: logURL),
+           modifiedAt.addingTimeInterval(1) < startedAt {
+            return nil
+        }
+
+        return FileSystem.lastNonEmptyLine(in: logURL)
     }
 
     func start(instanceID: String) throws {
@@ -186,10 +262,12 @@ final class InstanceSupervisor {
         let waitUntil = Date().addingTimeInterval(2)
         while Date() < waitUntil {
             var textReferenceCache: [Int32: [String]] = [:]
+            let now = Date()
             let refreshedPIDs = matchingPIDs(
                 for: report.instance,
-                in: observedProcesses(),
-                textReferenceCache: &textReferenceCache
+                in: observedProcesses(now: now),
+                textReferenceCache: &textReferenceCache,
+                now: now
             )
             if refreshedPIDs.isEmpty {
                 break
@@ -198,10 +276,12 @@ final class InstanceSupervisor {
         }
 
         var textReferenceCache: [Int32: [String]] = [:]
+        let now = Date()
         for pid in matchingPIDs(
             for: report.instance,
-            in: observedProcesses(),
-            textReferenceCache: &textReferenceCache
+            in: observedProcesses(now: now),
+            textReferenceCache: &textReferenceCache,
+            now: now
         ) {
             _ = ProcessRunner.run(executable: "/bin/kill", arguments: ["-KILL", String(pid)])
         }
@@ -280,7 +360,8 @@ final class InstanceSupervisor {
     private func matchingPIDs(
         for instance: OpenClawInstance,
         in processes: [ObservedProcess],
-        textReferenceCache: inout [Int32: [String]]
+        textReferenceCache: inout [Int32: [String]],
+        now: Date = Date()
     ) -> [Int32] {
         let matchers = instance.processMatch.isEmpty
             ? ["OPENCLAW_ASSISTANT_INSTANCE_ID=\(instance.id)"]
@@ -298,14 +379,15 @@ final class InstanceSupervisor {
             let matchesLaunchTokens = !launchTokens.isEmpty && launchTokens.allSatisfy { command.contains($0) }
             let looksLikeOpenClawProcess =
                 command.contains("scripts/run-node.mjs") ||
-                command.contains("gateway") ||
-                command.contains("openclaw")
+                command.contains("openclaw.mjs") ||
+                command.contains("openclaw-cn")
             let matchesTextReferences =
                 looksLikeOpenClawProcess &&
                 processReferencesRepository(
                     pid: process.pid,
                     repoPath: repoPath,
-                    cache: &textReferenceCache
+                    cache: &textReferenceCache,
+                    now: now
                 )
 
             guard
@@ -320,7 +402,7 @@ final class InstanceSupervisor {
         }
     }
 
-    private func observedProcesses() -> [ObservedProcess] {
+    private func observedProcesses(now: Date = Date()) -> [ObservedProcess] {
         let psOutput = ProcessRunner.run(
             executable: "/bin/ps",
             arguments: ["-axo", "pid=,command="]
@@ -338,7 +420,7 @@ final class InstanceSupervisor {
                 guard let pid = Int32(pidString) else { return nil }
 
                 let currentDirectory = shouldInspectCurrentDirectory(for: command)
-                    ? currentWorkingDirectory(for: pid)
+                    ? currentWorkingDirectory(for: pid, now: now)
                     : nil
 
                 return ObservedProcess(
@@ -422,32 +504,47 @@ final class InstanceSupervisor {
 
     private func shouldInspectCurrentDirectory(for command: String) -> Bool {
         let lowered = command.lowercased()
-        return ["node", "pnpm", "npm", "yarn", "bun", "openclaw", "gateway"].contains(where: lowered.contains)
+        return lowered.contains("scripts/run-node.mjs")
+            || lowered.contains("openclaw.mjs")
+            || lowered.contains("openclaw-cn")
     }
 
-    private func currentWorkingDirectory(for pid: Int32) -> String? {
+    private func currentWorkingDirectory(for pid: Int32, now: Date) -> String? {
+        if let cached = workingDirectoryCache[pid],
+           now.timeIntervalSince(cached.fetchedAt) < processMetadataCacheTTL {
+            return cached.value
+        }
+
         let result = ProcessRunner.run(
             executable: "/usr/sbin/lsof",
             arguments: ["-a", "-d", "cwd", "-p", String(pid), "-Fn"]
         )
         guard result.exitCode == 0 else {
+            workingDirectoryCache[pid] = CachedWorkingDirectory(value: nil, fetchedAt: now)
             return nil
         }
 
-        return result.stdout
+        let value = result.stdout
             .split(separator: "\n")
             .first(where: { $0.hasPrefix("n") })
             .map { String($0.dropFirst()) }
+        workingDirectoryCache[pid] = CachedWorkingDirectory(value: value, fetchedAt: now)
+        return value
     }
 
     private func processReferencesRepository(
         pid: Int32,
         repoPath: String,
-        cache: inout [Int32: [String]]
+        cache: inout [Int32: [String]],
+        now: Date
     ) -> Bool {
         let references: [String]
         if let cached = cache[pid] {
             references = cached
+        } else if let cached = processReferenceCache[pid],
+                  now.timeIntervalSince(cached.fetchedAt) < processMetadataCacheTTL {
+            references = cached.values
+            cache[pid] = cached.values
         } else {
             let result = ProcessRunner.run(
                 executable: "/usr/sbin/lsof",
@@ -458,6 +555,7 @@ final class InstanceSupervisor {
                 .filter { $0.hasPrefix("n") }
                 .map { standardizedPath(String($0.dropFirst())) }
             cache[pid] = parsed
+            processReferenceCache[pid] = CachedTextReferences(values: parsed, fetchedAt: now)
             references = parsed
         }
 

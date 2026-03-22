@@ -99,6 +99,9 @@ enum ProcessRunner {
 }
 
 enum FileSystem {
+    private static let defaultActivityScanMaxDepth = 2
+    private static let defaultActivityScanMaxEntriesPerRoot = 400
+
     static func ensureDirectory(_ url: URL) throws {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     }
@@ -114,6 +117,18 @@ enum FileSystem {
     }
 
     static func latestModificationDate(for paths: [String]) -> Date? {
+        latestModificationDate(
+            for: paths,
+            maxDepth: defaultActivityScanMaxDepth,
+            maxEntriesPerRoot: defaultActivityScanMaxEntriesPerRoot
+        )
+    }
+
+    static func latestModificationDate(
+        for paths: [String],
+        maxDepth: Int,
+        maxEntriesPerRoot: Int
+    ) -> Date? {
         let fileManager = FileManager.default
         let urls = paths.map { URL(fileURLWithPath: PathExpander.expand($0)) }
         var newest: Date?
@@ -121,29 +136,22 @@ enum FileSystem {
         for url in urls {
             guard fileManager.fileExists(atPath: url.path) else { continue }
 
-            if let values = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
-               let modified = values.contentModificationDate {
-                newest = maxDate(newest, modified)
-            }
-
-            guard let enumerator = fileManager.enumerator(
-                at: url,
-                includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            ) else {
-                continue
-            }
-
-            for case let childURL as URL in enumerator {
-                guard let values = try? childURL.resourceValues(forKeys: [.contentModificationDateKey]),
-                      let modified = values.contentModificationDate else {
-                    continue
-                }
-                newest = maxDate(newest, modified)
-            }
+            newest = maxOptionalDate(newest, newestModificationDate(
+                under: url,
+                fileManager: fileManager,
+                maxDepth: maxDepth,
+                maxEntries: maxEntriesPerRoot
+            ))
         }
 
         return newest
+    }
+
+    static func modificationDate(for url: URL) -> Date? {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return nil
+        }
+        return try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
     }
 
     static func lastNonEmptyLine(in url: URL) -> String? {
@@ -180,6 +188,65 @@ enum FileSystem {
     private static func maxDate(_ lhs: Date?, _ rhs: Date) -> Date {
         guard let lhs else { return rhs }
         return lhs > rhs ? lhs : rhs
+    }
+
+    private static func maxOptionalDate(_ lhs: Date?, _ rhs: Date?) -> Date? {
+        switch (lhs, rhs) {
+        case let (lhs?, rhs?):
+            return lhs > rhs ? lhs : rhs
+        case let (lhs?, nil):
+            return lhs
+        case let (nil, rhs?):
+            return rhs
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    private static func newestModificationDate(
+        under rootURL: URL,
+        fileManager: FileManager,
+        maxDepth: Int,
+        maxEntries: Int
+    ) -> Date? {
+        var newest: Date?
+        var queue: [(url: URL, depth: Int)] = [(rootURL, 0)]
+        var visitedEntries = 0
+
+        while !queue.isEmpty && visitedEntries <= maxEntries {
+            let current = queue.removeFirst()
+            let resourceKeys: Set<URLResourceKey> = [.contentModificationDateKey, .isDirectoryKey]
+
+            guard let values = try? current.url.resourceValues(forKeys: resourceKeys) else {
+                continue
+            }
+
+            if let modified = values.contentModificationDate {
+                newest = maxDate(newest, modified)
+            }
+
+            guard values.isDirectory == true, current.depth < maxDepth else {
+                continue
+            }
+
+            guard let children = try? fileManager.contentsOfDirectory(
+                at: current.url,
+                includingPropertiesForKeys: Array(resourceKeys),
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for child in children {
+                visitedEntries += 1
+                if visitedEntries > maxEntries {
+                    break
+                }
+                queue.append((child, current.depth + 1))
+            }
+        }
+
+        return newest
     }
 }
 
